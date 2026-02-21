@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode"
@@ -13,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type viewState int
@@ -33,6 +37,8 @@ type Model struct {
 	list     list.Model
 	input    textinput.Model
 	textarea textarea.Model
+	windowW  int
+	windowH  int
 	vault    string
 	current  string
 	editing  string
@@ -52,24 +58,79 @@ type deleteTarget struct {
 	isVault bool
 }
 
+var errFolderDialogCanceled = errors.New("folder dialog canceled")
+
+var (
+	colorPrimary = lipgloss.AdaptiveColor{Light: "#0F4C5C", Dark: "#7AD9F5"}
+	colorMuted   = lipgloss.AdaptiveColor{Light: "#475467", Dark: "#D4DEE8"}
+	colorBorder  = lipgloss.AdaptiveColor{Light: "#CBD5E1", Dark: "#3B4A5A"}
+	colorSuccess = lipgloss.AdaptiveColor{Light: "#1F7A3F", Dark: "#67D08B"}
+	colorWarning = lipgloss.AdaptiveColor{Light: "#B54708", Dark: "#FDBA74"}
+	colorError   = lipgloss.AdaptiveColor{Light: "#B42318", Dark: "#FF8D8D"}
+
+	appStyle        = lipgloss.NewStyle()
+	panelStyle      = lipgloss.NewStyle().Padding(0, 1)
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	subtitleStyle   = lipgloss.NewStyle().Foreground(colorMuted)
+	hintStyle       = lipgloss.NewStyle().Foreground(colorMuted)
+	statusInfoStyle = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	statusOkStyle   = lipgloss.NewStyle().Bold(true).Foreground(colorSuccess)
+	statusWarnStyle = lipgloss.NewStyle().Bold(true).Foreground(colorWarning)
+	statusErrStyle  = lipgloss.NewStyle().Bold(true).Foreground(colorError)
+)
+
 func initialModel() Model {
 	items := getVaults()
 	delegate := list.NewDefaultDelegate()
+	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.Foreground(colorPrimary)
+	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.Foreground(colorMuted)
+	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.Bold(true).Foreground(colorSuccess)
+	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.Foreground(colorSuccess)
+	delegate.Styles.DimmedTitle = delegate.Styles.DimmedTitle.Foreground(colorMuted)
+	delegate.Styles.DimmedDesc = delegate.Styles.DimmedDesc.Foreground(colorMuted)
+	delegate.SetSpacing(0)
+
 	l := list.New(items, delegate, 0, 0)
-	l.Title = "Select vault (Enter), create (Ctrl+N), open by path (Ctrl+O)"
+	l.Title = "Select vault (Enter), create (Ctrl+N), open by path (Ctrl+O), open in explorer (Ctrl+P)"
+	listStyles := list.DefaultStyles()
+	listStyles.Title = listStyles.Title.Bold(true).Foreground(colorPrimary)
+	listStyles.TitleBar = listStyles.TitleBar.BorderStyle(lipgloss.NormalBorder()).BorderBottom(true).BorderForeground(colorBorder)
+	listStyles.PaginationStyle = listStyles.PaginationStyle.Foreground(colorMuted)
+	listStyles.HelpStyle = listStyles.HelpStyle.Foreground(colorMuted)
+	listStyles.StatusBar = listStyles.StatusBar.Foreground(colorMuted)
+	listStyles.StatusEmpty = listStyles.StatusEmpty.Foreground(colorMuted)
+	listStyles.FilterPrompt = listStyles.FilterPrompt.Foreground(colorPrimary).Bold(true)
+	listStyles.FilterCursor = listStyles.FilterCursor.Foreground(colorPrimary)
+	l.Styles = listStyles
+	l.SetShowHelp(false)
+	l.SetShowStatusBar(false)
 
 	in := textinput.New()
 	in.Prompt = "> "
 	in.CharLimit = 200
 	in.Width = 60
+	in.PromptStyle = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	in.TextStyle = lipgloss.NewStyle().Foreground(colorPrimary)
+	in.PlaceholderStyle = lipgloss.NewStyle().Foreground(colorMuted)
+	in.Cursor.Style = lipgloss.NewStyle().Foreground(colorPrimary)
 
 	ta := textarea.New()
+	ta.Prompt = "> "
+	ta.ShowLineNumbers = true
+	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	ta.FocusedStyle.LineNumber = lipgloss.NewStyle().Foreground(colorMuted)
+	ta.FocusedStyle.CursorLineNumber = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle().Foreground(colorPrimary)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colorMuted)
+	ta.BlurredStyle = ta.FocusedStyle
 
 	return Model{
 		state:    stateVaultSelect,
 		list:     l,
 		input:    in,
 		textarea: ta,
+		windowW:  80,
+		windowH:  24,
 	}
 }
 
@@ -133,6 +194,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.enterPrompt(stateVaultOpenPath, "Vault path (absolute or relative)")
 				return m, textinput.Blink
 			}
+		case "ctrl+p":
+			if m.state == stateVaultSelect {
+				return m.openVaultByExplorer()
+			}
 		case "ctrl+d":
 			if m.state == stateFileList {
 				m = m.enterPrompt(stateDirCreate, "New directory name (in current directory)")
@@ -188,11 +253,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleEnter()
 		}
 	case tea.WindowSizeMsg:
-		m.list.SetSize(msg.Width, msg.Height)
-		m.textarea.SetWidth(msg.Width)
-		m.textarea.SetHeight(msg.Height)
-		m.input.Width = inputWidth(msg.Width)
+		m.windowW = msg.Width
+		m.windowH = msg.Height
+		m = m.applyResponsiveLayout()
 	}
+
+	m = m.applyResponsiveLayout()
 
 	switch m.state {
 	case stateVaultSelect, stateFileList:
@@ -224,6 +290,9 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		if it.mode == "open-vault-path" {
 			m = m.enterPrompt(stateVaultOpenPath, "Vault path (absolute or relative)")
 			return m, textinput.Blink
+		}
+		if it.mode == "open-vault-explorer" {
+			return m.openVaultByExplorer()
 		}
 		m.vault = it.path
 		m.current = it.path
@@ -283,32 +352,7 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		m = m.refreshFileList()
 		return m, nil
 	case stateVaultOpenPath:
-		rawPath := strings.TrimSpace(m.input.Value())
-		if rawPath == "" {
-			m.status = "Vault path cannot be empty"
-			return m, nil
-		}
-		cleanPath := strings.Trim(rawPath, "\"'")
-		abs, err := filepath.Abs(cleanPath)
-		if err != nil {
-			m.status = "Error: " + err.Error()
-			return m, nil
-		}
-		info, err := os.Stat(abs)
-		if err != nil {
-			m.status = "Error: cannot access this path"
-			return m, nil
-		}
-		if !info.IsDir() {
-			m.status = "Error: path must point to a directory"
-			return m, nil
-		}
-		m.vault = abs
-		m.current = abs
-		m.state = stateFileList
-		m.status = "Vault selected: " + filepath.Base(abs)
-		m = m.refreshFileList()
-		return m, nil
+		return m.openVaultPath(m.input.Value())
 	case stateFileCreate:
 		baseName := strings.TrimSpace(m.input.Value())
 		if baseName == "" {
@@ -360,33 +404,83 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	m = m.applyResponsiveLayout()
+	contentW, _ := m.contentDims()
+
 	switch m.state {
 	case stateVaultSelect:
-		view := "Vault storage: " + vaultStorageRoot() + "\n\n" + m.list.View() + "\n\nCtrl+N: create vault | Ctrl+O: open vault by path | Ctrl+X: delete selected vault"
-		if m.status != "" {
-			return m.status + "\n\n" + view
-		}
-		return view
+		return renderScreen(
+			contentW,
+			"Vaults",
+			"Storage: "+shrinkText(vaultStorageRoot(), maxInt(24, contentW-10)),
+			m.list.View(),
+			vaultSelectHints(contentW),
+			m.status,
+		)
 	case stateFileList:
-		header := fmt.Sprintf("Vault: %s\nPath: %s\n\n", filepath.Base(m.vault), relOrDot(m.vault, m.current))
-		hints := "Enter: open | Backspace: up | Ctrl+N: new file | Ctrl+D: new directory | Ctrl+X: delete selected | Ctrl+C: quit"
-		if m.status != "" {
-			hints = m.status + "\n" + hints
-		}
-		return header + m.list.View() + "\n\n" + hints
+		return renderScreen(
+			contentW,
+			"Vault: "+filepath.Base(m.vault),
+			"Path: "+shrinkText(relOrDot(m.vault, m.current), maxInt(24, contentW-7)),
+			m.list.View(),
+			fileListHints(contentW),
+			m.status,
+		)
 	case stateEditor:
-		return "Editing: " + relOrBase(m.vault, m.editing) + "\nCtrl+S: save | Esc: back\n\n" + m.textarea.View()
+		return renderScreen(
+			contentW,
+			"Editing: "+relOrBase(m.vault, m.editing),
+			"Markdown editor",
+			m.textarea.View(),
+			"Ctrl+S: save | Esc: back",
+			m.status,
+		)
 	case stateVaultCreate:
-		return "Create vault\nEnter name and press Enter\nEsc to cancel\n\n" + m.input.View()
+		return renderScreen(
+			contentW,
+			"Create Vault",
+			"Enter name and press Enter",
+			m.input.View(),
+			"Esc: cancel",
+			m.status,
+		)
 	case stateVaultOpenPath:
-		return "Open vault by path\nEnter full/relative folder path and press Enter\nEsc to cancel\n\n" + m.input.View()
+		return renderScreen(
+			contentW,
+			"Open Vault By Path",
+			"Enter full or relative folder path",
+			m.input.View(),
+			"Esc: cancel",
+			m.status,
+		)
 	case stateFileCreate:
-		return "Create file\nUse only letters and digits. .md is added automatically.\nEsc to cancel\n\n" + m.input.View()
+		return renderScreen(
+			contentW,
+			"Create File",
+			"Use only letters and digits, .md is added automatically",
+			m.input.View(),
+			"Esc: cancel",
+			m.status,
+		)
 	case stateDirCreate:
-		return "Create directory\nEnter directory name and press Enter\nEsc to cancel\n\n" + m.input.View()
+		return renderScreen(
+			contentW,
+			"Create Directory",
+			"Enter a directory name",
+			m.input.View(),
+			"Esc: cancel",
+			m.status,
+		)
 	case stateConfirmDelete:
 		if m.pending == nil {
-			return "Nothing selected for deletion.\nPress Esc to go back."
+			return renderScreen(
+				contentW,
+				"Delete",
+				"Nothing selected for deletion",
+				"",
+				"Esc: back",
+				m.status,
+			)
 		}
 		target := "file"
 		if m.pending.isDir {
@@ -395,13 +489,61 @@ func (m Model) View() string {
 		if m.pending.isVault {
 			target = "vault"
 		}
-		return fmt.Sprintf(
-			"Delete %s?\n%s\n\nY/Enter: delete permanently | N/Esc: cancel",
-			target,
+		return renderScreen(
+			contentW,
+			"Delete "+target+"?",
+			"",
 			m.pending.label,
+			deleteHints(contentW),
+			m.status,
 		)
 	default:
 		return ""
+	}
+}
+
+func renderScreen(contentW int, title string, subtitle string, body string, hints string, status string) string {
+	if contentW < 20 {
+		contentW = 20
+	}
+	parts := make([]string, 0, 5)
+	if strings.TrimSpace(title) != "" {
+		parts = append(parts, titleStyle.MaxWidth(contentW).Render(title))
+	}
+	if strings.TrimSpace(subtitle) != "" {
+		parts = append(parts, subtitleStyle.MaxWidth(contentW).Render(subtitle))
+	}
+	if strings.TrimSpace(status) != "" {
+		parts = append(parts, renderStatus(status, contentW))
+	}
+	if strings.TrimSpace(body) != "" {
+		parts = append(parts, body)
+	}
+	if strings.TrimSpace(hints) != "" {
+		parts = append(parts, hintStyle.MaxWidth(contentW).Render(hints))
+	}
+	content := strings.Join(parts, "\n")
+	return appStyle.Render(panelStyle.Render(content))
+}
+
+func renderStatus(status string, contentW int) string {
+	s := strings.TrimSpace(status)
+	if s == "" {
+		return ""
+	}
+	if contentW < 20 {
+		contentW = 20
+	}
+	lower := strings.ToLower(s)
+	switch {
+	case strings.HasPrefix(s, "Error:"):
+		return statusErrStyle.MaxWidth(contentW).Render(s)
+	case strings.Contains(lower, "deleted"):
+		return statusWarnStyle.MaxWidth(contentW).Render(s)
+	case strings.Contains(lower, "created"), strings.Contains(lower, "saved"), strings.Contains(lower, "selected"):
+		return statusOkStyle.MaxWidth(contentW).Render(s)
+	default:
+		return statusInfoStyle.MaxWidth(contentW).Render(s)
 	}
 }
 
@@ -456,7 +598,7 @@ func getVaults() []list.Item {
 		return strings.ToLower(dirs[i].title) < strings.ToLower(dirs[j].title)
 	})
 
-	items := make([]list.Item, 0, len(dirs)+1)
+	items := make([]list.Item, 0, len(dirs)+3)
 	for _, d := range dirs {
 		items = append(items, d)
 	}
@@ -469,6 +611,11 @@ func getVaults() []list.Item {
 		title: "+ Open vault by path",
 		desc:  "Open any existing directory as vault",
 		mode:  "open-vault-path",
+	})
+	items = append(items, item{
+		title: "+ Open vault in explorer",
+		desc:  "Pick an existing directory in a folder dialog",
+		mode:  "open-vault-explorer",
 	})
 	return items
 }
@@ -533,6 +680,95 @@ func (m Model) enterPrompt(state viewState, placeholder string) Model {
 	m.input.Placeholder = placeholder
 	m.input.Focus()
 	return m
+}
+
+func (m Model) openVaultPath(rawPath string) (tea.Model, tea.Cmd) {
+	cleanPath := strings.Trim(strings.TrimSpace(rawPath), "\"'")
+	if cleanPath == "" {
+		m.status = "Vault path cannot be empty"
+		return m, nil
+	}
+	abs, err := filepath.Abs(cleanPath)
+	if err != nil {
+		m.status = "Error: " + err.Error()
+		return m, nil
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		m.status = "Error: cannot access this path"
+		return m, nil
+	}
+	if !info.IsDir() {
+		m.status = "Error: path must point to a directory"
+		return m, nil
+	}
+
+	m.vault = abs
+	m.current = abs
+	m.state = stateFileList
+	m.status = "Vault selected: " + filepath.Base(abs)
+	m = m.refreshFileList()
+	return m, nil
+}
+
+func (m Model) openVaultByExplorer() (tea.Model, tea.Cmd) {
+	path, err := pickFolderInExplorer()
+	if err != nil {
+		if errors.Is(err, errFolderDialogCanceled) {
+			m.status = "Vault selection canceled"
+			return m, nil
+		}
+		m.status = "Error: " + err.Error()
+		return m, nil
+	}
+	return m.openVaultPath(path)
+}
+
+func (m Model) applyResponsiveLayout() Model {
+	contentW, contentH := m.contentDims()
+
+	m.input.Width = inputWidth(contentW)
+
+	reserved := 0
+	switch m.state {
+	case stateVaultSelect:
+		reserved = reserved + 1 + 1 + wrappedLineCount(vaultSelectHints(contentW), contentW)
+	case stateFileList:
+		reserved = reserved + 1 + 1 + wrappedLineCount(fileListHints(contentW), contentW)
+	case stateEditor:
+		reserved = reserved + 1 + 1 + wrappedLineCount("Ctrl+S: save | Esc: back", contentW)
+	case stateVaultCreate:
+		reserved = reserved + 1 + 1 + wrappedLineCount("Esc: cancel", contentW)
+	case stateVaultOpenPath:
+		reserved = reserved + 1 + 1 + wrappedLineCount("Esc: cancel", contentW)
+	case stateFileCreate:
+		reserved = reserved + 1 + 1 + wrappedLineCount("Esc: cancel", contentW)
+	case stateDirCreate:
+		reserved = reserved + 1 + 1 + wrappedLineCount("Esc: cancel", contentW)
+	case stateConfirmDelete:
+		reserved = reserved + 1 + wrappedLineCount(deleteHints(contentW), contentW)
+	}
+	if strings.TrimSpace(m.status) != "" {
+		reserved = reserved + wrappedLineCount(m.status, contentW)
+	}
+	reserved = reserved + 2
+
+	bodyH := maxInt(4, contentH-reserved)
+
+	m.list.SetSize(contentW, bodyH)
+	m.textarea.SetWidth(contentW)
+	m.textarea.SetHeight(maxInt(5, bodyH))
+	return m
+}
+
+func (m Model) contentDims() (int, int) {
+	windowW := m.windowW
+	windowH := m.windowH
+	if windowW <= 0 || windowH <= 0 {
+		windowW = 80
+		windowH = 24
+	}
+	return contentSize(windowW, windowH)
 }
 
 func (m Model) goParent() Model {
@@ -746,7 +982,7 @@ func (m Model) confirmDelete() (tea.Model, tea.Cmd) {
 			m.status = "Vault deleted: " + target.label
 		}
 		m.list.SetItems(getVaults())
-		m.list.Title = "Select vault (Enter), create (Ctrl+N), open by path (Ctrl+O)"
+		m.list.Title = "Select vault (Enter), create (Ctrl+N), open by path (Ctrl+O), open in explorer (Ctrl+P)"
 	} else {
 		m.status = "Deleted: " + target.label
 		m = m.refreshFileList()
@@ -757,6 +993,28 @@ func (m Model) confirmDelete() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func pickFolderInExplorer() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		script := "[void][Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');" +
+			"$dialog=New-Object System.Windows.Forms.FolderBrowserDialog;" +
+			"$dialog.Description='Select vault folder';" +
+			"$dialog.ShowNewFolderButton=$true;" +
+			"if($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($dialog.SelectedPath)}"
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+		if err != nil {
+			return "", fmt.Errorf("cannot open folder picker: %w", err)
+		}
+		p := strings.TrimSpace(string(out))
+		if p == "" {
+			return "", errFolderDialogCanceled
+		}
+		return p, nil
+	default:
+		return "", fmt.Errorf("folder picker is not implemented for %s", runtime.GOOS)
+	}
+}
+
 func isAlnumName(s string) bool {
 	for _, r := range s {
 		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
@@ -764,6 +1022,80 @@ func isAlnumName(s string) bool {
 		}
 	}
 	return true
+}
+
+func vaultSelectHints(width int) string {
+	if width < 72 {
+		return "Ctrl+N create | Ctrl+O path\nCtrl+P explorer | Ctrl+X delete"
+	}
+	return "Ctrl+N: create vault | Ctrl+O: open by path | Ctrl+P: open in explorer | Ctrl+X: delete vault"
+}
+
+func fileListHints(width int) string {
+	if width < 72 {
+		return "Enter open | Backspace up | Ctrl+N file\nCtrl+D dir | Ctrl+X delete | Ctrl+C quit"
+	}
+	return "Enter: open | Backspace: up | Ctrl+N: new file | Ctrl+D: new dir | Ctrl+X: delete | Ctrl+C: quit"
+}
+
+func deleteHints(width int) string {
+	if width < 58 {
+		return "Y/Enter: delete\nN/Esc: cancel"
+	}
+	return "Y/Enter: delete permanently | N/Esc: cancel"
+}
+
+func shrinkText(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 3 {
+		return string(r[:max])
+	}
+	return string(r[:max-3]) + "..."
+}
+
+func wrappedLineCount(s string, width int) int {
+	if width <= 0 || strings.TrimSpace(s) == "" {
+		return 0
+	}
+	lines := 0
+	for _, line := range strings.Split(s, "\n") {
+		r := len([]rune(line))
+		if r == 0 {
+			lines++
+			continue
+		}
+		lines += (r-1)/width + 1
+	}
+	return lines
+}
+
+func contentSize(windowW int, windowH int) (int, int) {
+	appW, appH := appStyle.GetFrameSize()
+	panelW, panelH := panelStyle.GetFrameSize()
+
+	width := windowW - appW - panelW
+	height := windowH - appH - panelH
+
+	if width < 20 {
+		width = 20
+	}
+	if height < 8 {
+		height = 8
+	}
+	return width, height
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func inputWidth(window int) int {
